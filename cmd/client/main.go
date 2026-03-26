@@ -1,0 +1,345 @@
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/cacggghp/vk-turn-proxy/pkg/dpi_evasion"
+	"github.com/cacggghp/vk-turn-proxy/pkg/probe"
+	"github.com/cacggghp/vk-turn-proxy/pkg/turn_discovery"
+	"github.com/cacggghp/vk-turn-proxy/pkg/v2ray_bridge"
+	"github.com/pion/dtls/v3"
+	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
+	"github.com/pion/logging"
+	"github.com/pion/turn/v5"
+)
+
+type options struct {
+	Turn         string
+	Port         string
+	Listen       string
+	Peer         string
+	Link         string
+	AutoTurn     bool
+	MimicVK      bool
+	PaddingMax   int
+	Jitter       int
+	N            int
+	UDP          bool
+	RotateTurn   bool
+	NoDTLS       bool
+	Hysteria     string
+	Probe        bool
+	V2ClientConf string
+	V2ServerConf string
+}
+
+type turnPool struct {
+	servers []turn_discovery.Server
+	next    atomic.Uint64
+}
+
+func (p *turnPool) pick() turn_discovery.Server {
+	if len(p.servers) == 0 {
+		return turn_discovery.Server{Host: "5.255.211.241", Port: "3478"}
+	}
+	i := int(p.next.Add(1)-1) % len(p.servers)
+	return p.servers[i]
+}
+
+func main() {
+	opt := parseFlags()
+	if opt.Hysteria != "" {
+		log.Printf("hysteria inner tunnel enabled with config: %s", opt.Hysteria)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	trap(cancel)
+
+	discoverer := turn_discovery.New()
+	res, err := discoverer.Discover(ctx, opt.Link, opt.AutoTurn)
+	if err != nil {
+		log.Printf("TURN auto-discovery failed, fallback enabled: %v", err)
+	}
+	if opt.Turn != "" {
+		res.Servers = []turn_discovery.Server{{Host: opt.Turn, Port: choosePort(opt.Port)}}
+	}
+
+	if opt.Probe {
+		pr := probe.Run(ctx)
+		if pr.Detected {
+			log.Printf("TSPU detected, enabling full evasion")
+			opt.MimicVK = true
+			if opt.PaddingMax < 512 {
+				opt.PaddingMax = 512
+			}
+			if opt.Jitter < 50 {
+				opt.Jitter = 50
+			}
+		}
+	}
+
+	peer, err := net.ResolveUDPAddr("udp", opt.Peer)
+	if err != nil {
+		log.Fatalf("resolve peer: %v", err)
+	}
+	listenConn, err := net.ListenPacket("udp", opt.Listen)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
+	}
+	defer listenConn.Close()
+
+	evader := dpi_evasion.New(dpi_evasion.Config{MimicVK: opt.MimicVK, PaddingMax: opt.PaddingMax, JitterMs: opt.Jitter})
+	pool := &turnPool{servers: res.Servers}
+
+	errCh := make(chan error, opt.N)
+	for i := 0; i < opt.N; i++ {
+		go func() {
+			errCh <- connectionLoop(ctx, opt, listenConn, peer, pool, evader)
+		}()
+	}
+
+	select {
+	case <-ctx.Done():
+	case err := <-errCh:
+		if err != nil {
+			log.Printf("worker ended: %v", err)
+		}
+	}
+}
+
+func parseFlags() options {
+	opt := options{}
+	vk := flag.String("vk-link", "", "VK call link")
+	ya := flag.String("yandex-link", "", "Yandex telemost link")
+	flag.StringVar(&opt.Turn, "turn", "", "override turn ip")
+	flag.StringVar(&opt.Port, "port", "", "override turn port")
+	flag.StringVar(&opt.Listen, "listen", "127.0.0.1:9000", "local listen")
+	flag.StringVar(&opt.Peer, "peer", "", "peer host:port")
+	flag.BoolVar(&opt.AutoTurn, "auto-turn", false, "dynamic TURN discovery")
+	flag.BoolVar(&opt.MimicVK, "mimic-vk", false, "mimic vk packet profile")
+	flag.IntVar(&opt.PaddingMax, "padding-max", 512, "max random padding")
+	flag.IntVar(&opt.Jitter, "jitter", 50, "max jitter ms")
+	flag.IntVar(&opt.N, "n", 4, "parallel streams (1-32)")
+	flag.BoolVar(&opt.UDP, "udp", false, "udp-only mode")
+	flag.BoolVar(&opt.RotateTurn, "rotate-turn", false, "rotate turn servers")
+	flag.BoolVar(&opt.NoDTLS, "no-dtls", false, "disable DTLS")
+	flag.StringVar(&opt.Hysteria, "hysteria", "", "hysteria2 json config path")
+	flag.BoolVar(&opt.Probe, "probe", true, "run TSPU probe")
+	flag.StringVar(&opt.V2ClientConf, "gen-v2ray-client", "", "write v2ray client json")
+	flag.StringVar(&opt.V2ServerConf, "gen-v2ray-server", "", "write v2ray server json")
+	flag.Parse()
+
+	if *vk == "" && *ya == "" {
+		log.Fatalf("need -vk-link or -yandex-link")
+	}
+	if opt.Peer == "" {
+		log.Fatalf("need -peer")
+	}
+	if *vk != "" {
+		opt.Link = *vk
+	} else {
+		opt.Link = *ya
+	}
+	if opt.N < 1 {
+		opt.N = 1
+	}
+	if opt.N > 32 {
+		opt.N = 32
+	}
+	if opt.V2ClientConf != "" || opt.V2ServerConf != "" {
+		generateV2(opt)
+	}
+	return opt
+}
+
+func generateV2(opt options) {
+	if opt.V2ClientConf != "" {
+		if err := v2ray_bridge.GenerateClient(opt.V2ClientConf); err != nil {
+			log.Printf("failed to generate client config: %v", err)
+		}
+	}
+	if opt.V2ServerConf != "" {
+		if err := v2ray_bridge.GenerateServer(opt.V2ServerConf); err != nil {
+			log.Printf("failed to generate server config: %v", err)
+		}
+	}
+}
+
+func trap(cancel context.CancelFunc) {
+	sc := make(chan os.Signal, 1)
+	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sc
+		cancel()
+	}()
+}
+
+func connectionLoop(ctx context.Context, opt options, listenConn net.PacketConn, peer *net.UDPAddr, pool *turnPool, evader *dpi_evasion.Evasion) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		server := pool.pick()
+		if err := oneConnection(ctx, opt, listenConn, peer, server, evader); err != nil {
+			log.Printf("turn %s failed: %v", server.Host, err)
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+	}
+}
+
+func oneConnection(ctx context.Context, opt options, listenConn net.PacketConn, peer *net.UDPAddr, server turn_discovery.Server, evader *dpi_evasion.Evasion) error {
+	addr := net.JoinHostPort(server.Host, choosePort(server.Port, opt.Port))
+	conn, err := dialTURN(ctx, addr, server, opt.UDP, peer.IP.To4() != nil)
+	if err != nil {
+		if !opt.UDP {
+			conn, err = dialFallbackTCP(ctx, addr, server, peer.IP.To4() != nil)
+			if err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+	defer conn.Close()
+
+	proxyConn := conn
+	if !opt.NoDTLS {
+		proxyConn, err = wrapDTLS(ctx, conn, peer)
+		if err != nil {
+			return err
+		}
+		defer proxyConn.Close()
+	}
+
+	var packets uint64
+	started := time.Now()
+	buf := make([]byte, 1600)
+	for {
+		if opt.RotateTurn && (packets > 10000 || time.Since(started) > 5*time.Minute) {
+			return fmt.Errorf("rotate-turn trigger")
+		}
+		listenConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, src, err := listenConn.ReadFrom(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			return err
+		}
+		out := evader.Transform(buf[:n])
+		evader.Delay()
+		proxyConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err = proxyConn.WriteTo(out, peer); err != nil {
+			return err
+		}
+		proxyConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		rn, _, err := proxyConn.ReadFrom(buf)
+		if err != nil {
+			return err
+		}
+		if _, err = listenConn.WriteTo(buf[:rn], src); err != nil {
+			return err
+		}
+		packets++
+	}
+}
+
+func dialTURN(ctx context.Context, addr string, s turn_discovery.Server, udp bool, ipv4 bool) (net.PacketConn, error) {
+	var pc net.PacketConn
+	if udp {
+		u, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			return nil, err
+		}
+		c, err := net.DialUDP("udp", nil, u)
+		if err != nil {
+			return nil, err
+		}
+		pc = &udpConnected{c}
+	} else {
+		d := net.Dialer{Timeout: 5 * time.Second}
+		c, err := d.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		pc = turn.NewSTUNConn(c)
+	}
+	family := turn.RequestedAddressFamilyIPv6
+	if ipv4 {
+		family = turn.RequestedAddressFamilyIPv4
+	}
+	cl, err := turn.NewClient(&turn.ClientConfig{STUNServerAddr: addr, TURNServerAddr: addr, Conn: pc, Username: s.Username, Password: s.Password, RequestedAddressFamily: family, LoggerFactory: logging.NewDefaultLoggerFactory()})
+	if err != nil {
+		return nil, err
+	}
+	if err = cl.Listen(); err != nil {
+		return nil, err
+	}
+	r, err := cl.Allocate()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("using TURN %s relayed=%s", addr, r.LocalAddr())
+	return r, nil
+}
+
+func dialFallbackTCP(ctx context.Context, addr string, s turn_discovery.Server, ipv4 bool) (net.PacketConn, error) {
+	return dialTURN(ctx, addr, s, true, ipv4)
+}
+
+func wrapDTLS(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.PacketConn, error) {
+	cert, err := selfsign.GenerateSelfSigned()
+	if err != nil {
+		return nil, err
+	}
+	cfg := &dtls.Config{Certificates: []tls.Certificate{cert}, InsecureSkipVerify: true, ExtendedMasterSecret: dtls.RequireExtendedMasterSecret, CipherSuites: []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256}, FlightInterval: 100 * time.Millisecond}
+	dc, err := dtls.Client(conn, peer, cfg)
+	if err != nil {
+		return nil, err
+	}
+	hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err = dc.HandshakeContext(hctx); err != nil {
+		return nil, err
+	}
+	return &dtlsPacket{Conn: dc}, nil
+}
+
+type udpConnected struct{ *net.UDPConn }
+
+func (u *udpConnected) WriteTo(p []byte, _ net.Addr) (int, error) { return u.Write(p) }
+
+type dtlsPacket struct{ Conn net.Conn }
+
+func (d *dtlsPacket) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, err := d.Conn.Read(p)
+	return n, d.Conn.RemoteAddr(), err
+}
+func (d *dtlsPacket) WriteTo(p []byte, _ net.Addr) (int, error) { return d.Conn.Write(p) }
+func (d *dtlsPacket) Close() error                              { return d.Conn.Close() }
+func (d *dtlsPacket) LocalAddr() net.Addr                       { return d.Conn.LocalAddr() }
+func (d *dtlsPacket) SetDeadline(t time.Time) error             { return d.Conn.SetDeadline(t) }
+func (d *dtlsPacket) SetReadDeadline(t time.Time) error         { return d.Conn.SetReadDeadline(t) }
+func (d *dtlsPacket) SetWriteDeadline(t time.Time) error        { return d.Conn.SetWriteDeadline(t) }
+
+func choosePort(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return "3478"
+}

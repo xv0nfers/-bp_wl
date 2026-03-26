@@ -2,6 +2,25 @@
 Проброс трафика WireGuard/Hysteria через TURN сервера VK звонков или Яндекс телемоста. Пакеты шифруются DTLS 1.2, затем параллельными потоками через TCP или UDP отправляются на TURN сервер по протоколу STUN ChannelData. Оттуда по UDP отправляются на ваш сервер, где расшифровываются и передаются в WireGuard. Логин/пароль от TURN генерируются из ссылки на звонок.
 
 Только для учебных целей!
+
+## TSPU Full Bypass Mode
+
+Одна команда для максимальной обфускации:
+
+```bash
+./client -auto-turn -mimic-vk -n 4 -listen 127.0.0.1:9000
+```
+
+Что включается:
+- Dynamic TURN discovery (`-auto-turn`) + fallback на `5.255.211.24x`.
+- DPI evasion: DTLS 1.2, random padding, jitter, mimic VK packet profile.
+- TSPU probe: до старта проверяет признаки блокировок и автоматически включает max evasion.
+- Failover/rotation TURN: `-rotate-turn` (по 5 минут или ~10k пакетов).
+- Multi-stream: `-n 1..32` (по умолчанию `4`).
+- UDP-only mode: `-udp` + TCP fallback.
+- Hysteria2 inner tunnel: `-hysteria /path/to/config.json`.
+- V2Ray/Xray/sing-box bridge: см. `configs/v2ray-client.json` и `configs/v2ray-server.json`.
+
 ## Настройка
 Нам понадобится:
 1. Ссылка на действующий ВК звонок: создаём свой (нужен аккаунт вк), или гуглим `"https://vk.com/call/join/"`.
@@ -82,33 +101,19 @@ chmod 777 ./client-android
 
 Добавьте флаг `-n 1` для более стабильного подключения в 1 поток (ограничение 5 Мбит/с для ВК)
 
-## Яндекс телемост
-**UPD. ТЕЛЕМОСТ ЗАКРЫЛИ**
-
-В отличие от ВК, сервера яндекса не ограничивают скорость, так что по умолчанию стоит `-n 1`. Увеличение этого числа может привести к временной блокировке по IP из-за переполнения конференции фейковыми участниками.
-
-В режиме `-udp` скорость обычно больше
-
-Большинство диапазонов IP TURN серверов Яндекса не работают, указывайте вручную через `-turn`
-<details>
-    <summary>
-        Рабочие IP
-    </summary>
-
-
-    5.255.211.241
-    5.255.211.242
-    5.255.211.243
-    5.255.211.245
-    5.255.211.246
-
-
-</details>
-Спасибо https://github.com/KillTheCensorship/Turnel за часть кода :)
-
 ## v2ray
 
 Вместо WireGuard можно использовать любое V2Ray-ядро которое его поддерживает (например, xray или sing-box) и любой V2Ray-клиент который использует это ядро (например, v2rayN или v2rayNG). С помощью их вы сможете добавить больше входящих интерфейсов (например, SOCKS) и реализовать точечный роутинг.
+
+Готовые конфиги:
+- `configs/v2ray-client.json`
+- `configs/v2ray-server.json`
+
+Авто-генерация:
+```bash
+./client -gen-v2ray-client configs/v2ray-client.json -gen-v2ray-server configs/v2ray-server.json -vk-link <link> -peer <server:56000>
+```
+
 
 Пример конфигов:
 

@@ -15,6 +15,12 @@ Write-Host "Default gateway: $gateway"
 $input | ForEach-Object {
     $addr = $_.Trim()
     if ($addr -eq "") { return }
+    $addr = $addr -replace '^TURN_IP=', ''
+    $addr = $addr -replace '^WG_ENDPOINT=', ''
+    if ($addr.Contains(':')) {
+        $addr = $addr.Split(':')[0]
+    }
+    if ($addr -notmatch '^\d+\.\d+\.\d+\.\d+$') { return }
 
     Write-Host "Добавляем маршрут к $addr через $gateway"
 
@@ -24,4 +30,3 @@ $input | ForEach-Object {
         -PolicyStore ActiveStore `
         -ErrorAction Stop
 }
-
