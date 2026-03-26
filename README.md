@@ -1,223 +1,168 @@
-# Good TURN
-Проброс трафика WireGuard/Hysteria через TURN сервера VK звонков или Яндекс телемоста. Пакеты шифруются DTLS 1.2, затем параллельными потоками через TCP или UDP отправляются на TURN сервер по протоколу STUN ChannelData. Оттуда по UDP отправляются на ваш сервер, где расшифровываются и передаются в WireGuard. Логин/пароль от TURN генерируются из ссылки на звонок.
+# vk-turn-proxy
 
-Только для учебных целей!
+Прокси-транспорт для передачи трафика через TURN (VK/Telemost) с DTLS-обёрткой, multi-stream режимом, авто-discovery TURN и генерацией конфигов для V2Ray/Xray/sing-box.
+
+> ⚠️ Важно: используйте проект только в законных и разрешённых сценариях (собственная инфраструктура, тестовые стенды, лаборатории).
+
+## Содержание
+- [Быстрый старт](#быстрый-старт)
+- [TSPU Full Bypass Mode](#tspu-full-bypass-mode)
+- [Флаги клиента](#флаги-клиента)
+- [Флаги сервера](#флаги-сервера)
+- [Платформенные инструкции](#платформенные-инструкции)
+- [V2Ray/Xray/sing-box](#v2rayxraysing-box)
+- [Advanced Normalization Options](#advanced-normalization-options)
+- [Troubleshooting](#troubleshooting)
+
+## Быстрый старт
+
+### 1) Сервер
+```bash
+./server -listen 0.0.0.0:56000 -connect 127.0.0.1:<wireguard_port>
+```
+
+### 2) Клиент
+```bash
+./client -peer <server_ip:56000> -vk-link <https://vk.com/call/join/...> -listen 127.0.0.1:9000
+```
+
+### 3) WireGuard
+- Endpoint в клиентском WG-конфиге: `127.0.0.1:9000`
+- MTU: `1280`
+
+---
 
 ## TSPU Full Bypass Mode
 
-Одна команда для максимальной обфускации:
+Режим из одного запуска (как в исходной документации):
 
 ```bash
-./client -auto-turn -mimic-vk -n 4 -listen 127.0.0.1:9000
+./client -auto-turn -mimic-vk -n 4 -listen 127.0.0.1:9000 -peer <server_ip:56000> -vk-link <link>
 ```
 
-Что включается:
-- Dynamic TURN discovery (`-auto-turn`) + fallback на `5.255.211.24x`.
-- DPI evasion: DTLS 1.2, random padding, jitter, mimic VK packet profile.
-- TSPU probe: до старта проверяет признаки блокировок и автоматически включает max evasion.
-- Failover/rotation TURN: `-rotate-turn` (по 5 минут или ~10k пакетов).
-- Multi-stream: `-n 1..32` (по умолчанию `4`).
-- UDP-only mode: `-udp` + TCP fallback.
-- Hysteria2 inner tunnel: `-hysteria /path/to/config.json`.
-- V2Ray/Xray/sing-box bridge: см. `configs/v2ray-client.json` и `configs/v2ray-server.json`.
+Что включает запуск:
+- discovery TURN с fallback на hardcoded список;
+- packet shaping/jitter/padding;
+- параллельные потоки (по умолчанию 4);
+- встроенный pre-flight probe (если включён `-probe`).
 
-## Настройка
-Нам понадобится:
-1. Ссылка на действующий ВК звонок: создаём свой (нужен аккаунт вк), или гуглим `"https://vk.com/call/join/"`.
-Ссылка действительна вечно, если не нажимать "завершить звонок для всех"
-2. Или ссыска на звонок Яндекс телемоста: `"https://telemost.yandex.ru/j/"`. Её лучше не гуглить, так как видно подключение к конференции
-3. VPS с установленным WireGuard
-4. Для андроида: скачать Termux из F-Droid
-### Сервер
-```
-./server -listen 0.0.0.0:56000 -connect 127.0.0.1:<порт wg>
-```
-### Клиент
-#### Android
+> ⚠️ Применяйте только в легитимных целях диагностики устойчивости сети и транспорта.
 
-**Рекомендуемый способ:**
-Использовать нативное Android-приложение [vk-turn-proxy-android](https://github.com/MYSOREZ/vk-turn-proxy-android).
-- В клиентском конфиге WireGuard меняем адрес сервера на `127.0.0.1:9000`, ставим MTU 1280
--  **Добавляем приложение в исключения WireGuard. Нажимаем "сохранить".**
+---
 
-**Альтернативный способ (через Termux):**
-- В клиентском конфиге WireGuard меняем адрес сервера на `127.0.0.1:9000`, ставим MTU 1280
--  **Добавляем Termux в исключения WireGuard. Нажимаем "сохранить".**
-В Termux:
-```
-termux-wake-lock
-```
-Телефон не будет уходить в глубокий сон, так что на ночь ставьте на зарядку. Чтобы отключить:
-```
-termux-wake-unlock
-```
-Копируем бинарник в локальную папку, даём права на исполнение:
-```
-cp /sdcard/Download/client-android ./
-chmod 777 ./client-android
-```
-Запускаем:
-```
-./client-android -peer <ip сервера wg>:56000 -vk-link <VK ссылка> -listen 127.0.0.1:9000
-```
-Или
-```
-./client-android -udp -turn 5.255.211.241 -peer <ip сервера wg>:56000 -yandex-link <Ya ссылка> -listen 127.0.0.1:9000
-```
+## Флаги клиента
 
-**Если после включения VPN в терминале вылезают ошибки DNS, попробуйте в Wireguard включить VPN только для нужных приложений.**
-#### Linux
-В клиентском конфиге WireGuard меняем адрес сервера на `127.0.0.1:9000`, ставим MTU 1280
+| Флаг | По умолчанию | Описание |
+|---|---:|---|
+| `-peer` | — | Адрес удалённого сервера (`host:port`), обязателен. |
+| `-listen` | `127.0.0.1:9000` | Локальный UDP listener для туннеля. |
+| `-vk-link` / `-yandex-link` | — | Ссылка для получения TURN credentials/endpoint. Один из двух обязателен. |
+| `-turn` | `""` | Ручной override TURN IP/host. |
+| `-port` | `""` | Ручной override порта TURN. |
+| `-auto-turn` | `false` | Включает discovery TURN. |
+| `-mimic-vk` | `false` | Включает профиль под размеры/тайминги голосового трафика. |
+| `-padding-max` | `512` | Максимум добавочного padding (байты). |
+| `-jitter` | `50` | Верхняя граница jitter (мс). |
+| `-n` | `4` | Количество потоков (ограничено `1..32`). |
+| `-udp` | `false` | UDP-only режим подключения к TURN. |
+| `-rotate-turn` | `false` | Ротация TURN по таймеру/счётчику пакетов. |
+| `-no-dtls` | `false` | Отключает DTLS-обёртку (не рекомендуется). |
+| `-hysteria` | `""` | Путь к JSON-конфигу inner tunnel Hysteria2. |
+| `-probe` | `true` | Pre-flight probe сети перед установкой канала. |
+| `-gen-v2ray-client` | `""` | Сгенерировать шаблон client JSON. |
+| `-gen-v2ray-server` | `""` | Сгенерировать шаблон server JSON. |
 
-Скрипт будет добавлять маршруты к нужным ip:
+## Флаги сервера
 
-```
-./client-linux -peer <ip сервера wg>:56000 -vk-link <VK ссылка> -listen 127.0.0.1:9000 | sudo routes.sh
+| Флаг | По умолчанию | Описание |
+|---|---:|---|
+| `-listen` | `0.0.0.0:56000` | Внешний адрес приёма трафика от client. |
+| `-connect` | `127.0.0.1:51820` | Адрес назначения (обычно WireGuard). |
+| `-udp` | `false` | Обработка UDP трафика без TCP fallback. |
+
+---
+
+## Платформенные инструкции
+
+### Android / Termux
+1. В WG-клиенте выставьте endpoint `127.0.0.1:9000`, `MTU=1280`.
+2. Добавьте только необходимые приложения в exclusions.
+3. Для долгой сессии в Termux:
+   ```bash
+   termux-wake-lock
+   ```
+4. Запуск:
+   ```bash
+   ./client-android -peer <server:56000> -vk-link <link> -listen 127.0.0.1:9000
+   ```
+
+### Linux
+```bash
+./client -peer <server:56000> -vk-link <link> -listen 127.0.0.1:9000 | sudo ./routes.sh
 ```
 
-```
-./client-linux -udp -turn 5.255.211.241 -peer <ip сервера wg>:56000 -yandex-link <Ya ссылка> -listen 127.0.0.1:9000 | sudo routes.sh
-```
-
-Не включайте впн, пока программа не установит соединение! В отличие от андроида, здесь часть запросов будет идти через впн (dns и запрос подключения к turn)
-#### Windows
-В клиентском конфиге WireGuard меняем адрес сервера на `127.0.0.1:9000`, ставим MTU 1280
-
-В PowerShell от Администратора (чтобы скрипт прописывал маршруты):
-
-```
-./client.exe -peer <ip сервера wg>:56000 -vk-link <VK ссылка> -listen 127.0.0.1:9000 | routes.ps1
+### Windows (PowerShell от администратора)
+```powershell
+./client.exe -peer <server:56000> -vk-link <link> -listen 127.0.0.1:9000 | ./routes.ps1
 ```
 
-```
-./client.exe -udp -turn 5.255.211.241 -peer <ip сервера wg>:56000 -yandex-link <Ya ссылка> -listen 127.0.0.1:9000 | routes.ps1
-```
+---
 
-Не включайте впн, пока программа не установит соединение! В отличие от андроида, здесь часть запросов будет идти через впн (dns и запрос подключения к turn)
-### Если не работает
-С помощью опции `-turn` можно указать адрес TURN сервера вручную. Это должен быть сервер ВК, Макса или Одноклассников (ссылка вк) или Яндекса (ссылка яндекса). Возможно потом составлю список.
+## V2Ray/Xray/sing-box
 
-Если не работает TCP, попробуйте добавить флаг `-udp`.
-
-Добавьте флаг `-n 1` для более стабильного подключения в 1 поток (ограничение 5 Мбит/с для ВК)
-
-## v2ray
-
-Вместо WireGuard можно использовать любое V2Ray-ядро которое его поддерживает (например, xray или sing-box) и любой V2Ray-клиент который использует это ядро (например, v2rayN или v2rayNG). С помощью их вы сможете добавить больше входящих интерфейсов (например, SOCKS) и реализовать точечный роутинг.
-
-Готовые конфиги:
+Готовые шаблоны:
 - `configs/v2ray-client.json`
 - `configs/v2ray-server.json`
 
-Авто-генерация:
+Автогенерация:
 ```bash
-./client -gen-v2ray-client configs/v2ray-client.json -gen-v2ray-server configs/v2ray-server.json -vk-link <link> -peer <server:56000>
+./client -peer <server:56000> -vk-link <link> \
+  -gen-v2ray-client configs/v2ray-client.json \
+  -gen-v2ray-server configs/v2ray-server.json
 ```
 
+---
 
-Пример конфигов:
+## Advanced Normalization Options
 
-<details>
+Расширенные параметры нормализации/шумоподобия задаются текущими флагами:
+- `-mimic-vk`
+- `-padding-max`
+- `-jitter`
+- `-n`
+- `-rotate-turn`
 
-<summary>
-Клиент
-</summary>
+Рекомендуемые профили:
 
-```json
-{
-    "inbounds": [
-        {
-            "protocol": "socks",
-            "listen": "127.0.0.1",
-            "port": 1080,
-            "settings": {
-                "udp": true
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": [
-                    "http",
-                    "tls"
-                ]
-            }
-        },
-        {
-            "protocol": "http",
-            "listen": "127.0.0.1",
-            "port": 8080,
-            "sniffing": {
-                "enabled": true,
-                "destOverride": [
-                    "http",
-                    "tls"
-                ]
-            }
-        }
-    ],
-    "outbounds": [
-        {
-            "protocol": "wireguard",
-            "settings": {
-                "secretKey": "<client secret key>",
-                "peers": [
-                    {
-                        "endpoint": "127.0.0.1:9000",
-                        "publicKey": "<server public key>"
-                    }
-                ],
-                "domainStrategy": "ForceIPv4",
-                "mtu": 1280
-            }
-        }
-    ]
-}
-```
+| Профиль | Команда |
+|---|---|
+| Conservative | `./client -peer <peer> -vk-link <link> -n 1 -padding-max 64 -jitter 20` |
+| Balanced | `./client -peer <peer> -vk-link <link> -n 4 -mimic-vk -padding-max 256 -jitter 35` |
+| Aggressive | `./client -peer <peer> -vk-link <link> -n 8 -mimic-vk -padding-max 512 -jitter 50 -rotate-turn` |
 
-</details>
+---
 
-<details>
+## Troubleshooting
 
-<summary>
-Сервер
-</summary>
+### Не подключается вообще
+- Проверьте, что задан `-peer` и один из `-vk-link` / `-yandex-link`.
+- Для диагностики выключите сложные режимы: `-n 1` и без `-rotate-turn`.
 
-```json
-{
-    "inbounds": [
-        {
-            "protocol": "wireguard",
-            "listen": "0.0.0.0",
-            "port": 51820,
-            "settings": {
-                "secretKey": "<server secret key>",
-                "peers": [
-                    {
-                        "publicKey": "<client public key>"
-                    }
-                ],
-                "mtu": 1280
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": [
-                    "http",
-                    "tls"
-                ]
-            }
-        }
-    ],
-    "outbounds": [
-        {
-            "protocol": "freedom",
-            "settings": {
-                "domainStrategy": "UseIPv4"
-            }
-        }
-    ]
-}
-```
+### Нестабильный канал / частые реконнекты
+- Уменьшите `-n` до `1` или `2`.
+- Уменьшите `-padding-max` и `-jitter`.
+- Проверьте MTU: должен быть `1280`.
 
-</details>
+### Не работает TCP путь до TURN
+- Попробуйте `-udp`.
+- Явно задайте TURN: `-turn <ip> -port 3478`.
 
-## Direct mode
-С флагом `-no-dtls` можно отправлять пакеты без обфускации DTLS и подключаться к обычным серверам Wireguard. Может привести к бану от вк/яндекса.
+### DNS/маршрутизация конфликтует с VPN
+- На Android включите split tunneling только для нужных приложений.
+- На Linux/Windows используйте `routes.sh`/`routes.ps1` и не поднимайте VPN до готовности клиента.
+
+---
+
+## Скриншоты логов
+
+В non-interactive окружении браузерный инструмент для снятия скриншотов не использовался. Вместо этого ориентируйтесь на текстовые логи клиента/сервера.
