@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -39,31 +42,152 @@ type options struct {
 	NoDTLS       bool
 	Hysteria     string
 	Probe        bool
+	DryRun       bool
 	V2ClientConf string
 	V2ServerConf string
 }
 
-type turnPool struct {
-	servers []turn_discovery.Server
-	next    atomic.Uint64
+type streamLogger struct {
+	streamID int
 }
 
-func (p *turnPool) pick() turn_discovery.Server {
-	if len(p.servers) == 0 {
-		return turn_discovery.Server{Host: "5.255.211.241", Port: "3478"}
+func (l streamLogger) log(event string, fields map[string]any) {
+	payload := map[string]any{"event": event, "stream_id": l.streamID, "ts": time.Now().UTC().Format(time.RFC3339Nano)}
+	for k, v := range fields {
+		payload[k] = v
 	}
-	i := int(p.next.Add(1)-1) % len(p.servers)
-	return p.servers[i]
+	b, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("event=%s stream_id=%d marshal_error=%v", event, l.streamID, err)
+		return
+	}
+	log.Print(string(b))
+}
+
+type telemetry struct {
+	reconnects atomic.Uint64
+	failovers  atomic.Uint64
+	mu         sync.Mutex
+	latencyMs  map[string][]int64
+}
+
+func newTelemetry() *telemetry {
+	return &telemetry{latencyMs: map[string][]int64{"lt100": {}, "lt300": {}, "lt1000": {}, "ge1000": {}}}
+}
+
+func (t *telemetry) ObserveLatency(_ string, latency time.Duration, err error) {
+	if err != nil {
+		return
+	}
+	ms := latency.Milliseconds()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch {
+	case ms < 100:
+		t.latencyMs["lt100"] = append(t.latencyMs["lt100"], ms)
+	case ms < 300:
+		t.latencyMs["lt300"] = append(t.latencyMs["lt300"], ms)
+	case ms < 1000:
+		t.latencyMs["lt1000"] = append(t.latencyMs["lt1000"], ms)
+	default:
+		t.latencyMs["ge1000"] = append(t.latencyMs["ge1000"], ms)
+	}
+}
+
+func (t *telemetry) snapshot() map[string]any {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return map[string]any{
+		"reconnect_total": t.reconnects.Load(),
+		"failover_total":  t.failovers.Load(),
+		"latency_bins": map[string]int{
+			"lt100":  len(t.latencyMs["lt100"]),
+			"lt300":  len(t.latencyMs["lt300"]),
+			"lt1000": len(t.latencyMs["lt1000"]),
+			"ge1000": len(t.latencyMs["ge1000"]),
+		},
+	}
+}
+
+type turnNode struct {
+	server      turn_discovery.Server
+	healthScore float64
+	fails       int
+}
+
+type turnPool struct {
+	mu    sync.Mutex
+	nodes []turnNode
+	next  atomic.Uint64
+}
+
+func newTurnPool(servers []turn_discovery.Server) *turnPool {
+	if len(servers) == 0 {
+		servers = []turn_discovery.Server{{Host: "5.255.211.241", Port: "3478"}}
+	}
+	nodes := make([]turnNode, 0, len(servers))
+	for _, s := range servers {
+		nodes = append(nodes, turnNode{server: s, healthScore: 1.0})
+	}
+	return &turnPool{nodes: nodes}
+}
+
+func (p *turnPool) pick() turnNode {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.nodes) == 0 {
+		return turnNode{server: turn_discovery.Server{Host: "5.255.211.241", Port: "3478"}, healthScore: 1.0}
+	}
+	start := int(p.next.Add(1)-1) % len(p.nodes)
+	best := start
+	bestScore := p.nodes[start].healthScore
+	for i := 1; i < len(p.nodes); i++ {
+		idx := (start + i) % len(p.nodes)
+		if p.nodes[idx].healthScore > bestScore {
+			best = idx
+			bestScore = p.nodes[idx].healthScore
+		}
+	}
+	return p.nodes[best]
+}
+
+func (p *turnPool) report(host string, success bool) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.nodes {
+		if p.nodes[i].server.Host != host {
+			continue
+		}
+		if success {
+			p.nodes[i].fails = 0
+			p.nodes[i].healthScore += 0.1
+			if p.nodes[i].healthScore > 1.0 {
+				p.nodes[i].healthScore = 1.0
+			}
+			return 0
+		}
+		p.nodes[i].fails++
+		p.nodes[i].healthScore -= 0.25
+		if p.nodes[i].healthScore < 0.1 {
+			p.nodes[i].healthScore = 0.1
+		}
+		return p.nodes[i].fails
+	}
+	return 1
 }
 
 func main() {
-	opt := parseFlags()
+	opt, err := parseFlagsFrom(os.Args[1:])
+	if err != nil {
+		log.Fatal(err)
+	}
 	if opt.Hysteria != "" {
 		log.Printf("hysteria inner tunnel enabled with config: %s", opt.Hysteria)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	trap(cancel)
+	metrics := newTelemetry()
 
 	discoverer := turn_discovery.New()
 	res, err := discoverer.Discover(ctx, opt.Link, opt.AutoTurn)
@@ -75,7 +199,7 @@ func main() {
 	}
 
 	if opt.Probe {
-		pr := probe.Run(ctx)
+		pr := probe.RunWithHook(ctx, metrics)
 		if pr.Detected {
 			log.Printf("TSPU detected, enabling full evasion")
 			opt.MimicVK = true
@@ -86,6 +210,13 @@ func main() {
 				opt.Jitter = 50
 			}
 		}
+	}
+
+	if opt.DryRun {
+		log.Printf("dry-run completed: provider=%s turn_servers=%d", res.Provider, len(res.Servers))
+		b, _ := json.Marshal(metrics.snapshot())
+		log.Printf("telemetry=%s", b)
+		return
 	}
 
 	peer, err := net.ResolveUDPAddr("udp", opt.Peer)
@@ -99,13 +230,13 @@ func main() {
 	defer listenConn.Close()
 
 	evader := dpi_evasion.New(dpi_evasion.Config{MimicVK: opt.MimicVK, PaddingMax: opt.PaddingMax, JitterMs: opt.Jitter})
-	pool := &turnPool{servers: res.Servers}
+	pool := newTurnPool(res.Servers)
 
 	errCh := make(chan error, opt.N)
 	for i := 0; i < opt.N; i++ {
-		go func() {
-			errCh <- connectionLoop(ctx, opt, listenConn, peer, pool, evader)
-		}()
+		go func(streamID int) {
+			errCh <- connectionLoop(ctx, opt, streamLogger{streamID: streamID}, listenConn, peer, pool, evader, metrics)
+		}(i + 1)
 	}
 
 	select {
@@ -117,33 +248,37 @@ func main() {
 	}
 }
 
-func parseFlags() options {
+func parseFlagsFrom(args []string) (options, error) {
 	opt := options{}
-	vk := flag.String("vk-link", "", "VK call link")
-	ya := flag.String("yandex-link", "", "Yandex telemost link")
-	flag.StringVar(&opt.Turn, "turn", "", "override turn ip")
-	flag.StringVar(&opt.Port, "port", "", "override turn port")
-	flag.StringVar(&opt.Listen, "listen", "127.0.0.1:9000", "local listen")
-	flag.StringVar(&opt.Peer, "peer", "", "peer host:port")
-	flag.BoolVar(&opt.AutoTurn, "auto-turn", false, "dynamic TURN discovery")
-	flag.BoolVar(&opt.MimicVK, "mimic-vk", false, "mimic vk packet profile")
-	flag.IntVar(&opt.PaddingMax, "padding-max", 512, "max random padding")
-	flag.IntVar(&opt.Jitter, "jitter", 50, "max jitter ms")
-	flag.IntVar(&opt.N, "n", 4, "parallel streams (1-32)")
-	flag.BoolVar(&opt.UDP, "udp", false, "udp-only mode")
-	flag.BoolVar(&opt.RotateTurn, "rotate-turn", false, "rotate turn servers")
-	flag.BoolVar(&opt.NoDTLS, "no-dtls", false, "disable DTLS")
-	flag.StringVar(&opt.Hysteria, "hysteria", "", "hysteria2 json config path")
-	flag.BoolVar(&opt.Probe, "probe", true, "run TSPU probe")
-	flag.StringVar(&opt.V2ClientConf, "gen-v2ray-client", "", "write v2ray client json")
-	flag.StringVar(&opt.V2ServerConf, "gen-v2ray-server", "", "write v2ray server json")
-	flag.Parse()
+	fs := flag.NewFlagSet("client", flag.ContinueOnError)
+	vk := fs.String("vk-link", "", "VK call link")
+	ya := fs.String("yandex-link", "", "Yandex telemost link")
+	fs.StringVar(&opt.Turn, "turn", "", "override turn ip")
+	fs.StringVar(&opt.Port, "port", "", "override turn port")
+	fs.StringVar(&opt.Listen, "listen", "127.0.0.1:9000", "local listen")
+	fs.StringVar(&opt.Peer, "peer", "", "peer host:port")
+	fs.BoolVar(&opt.AutoTurn, "auto-turn", false, "dynamic TURN discovery")
+	fs.BoolVar(&opt.MimicVK, "mimic-vk", false, "mimic vk packet profile")
+	fs.IntVar(&opt.PaddingMax, "padding-max", 512, "max random padding")
+	fs.IntVar(&opt.Jitter, "jitter", 50, "max jitter ms")
+	fs.IntVar(&opt.N, "n", 4, "parallel streams (1-32)")
+	fs.BoolVar(&opt.UDP, "udp", false, "udp-only mode")
+	fs.BoolVar(&opt.RotateTurn, "rotate-turn", false, "rotate turn servers")
+	fs.BoolVar(&opt.NoDTLS, "no-dtls", false, "disable DTLS")
+	fs.StringVar(&opt.Hysteria, "hysteria", "", "hysteria2 json config path")
+	fs.BoolVar(&opt.Probe, "probe", true, "run TSPU probe")
+	fs.BoolVar(&opt.DryRun, "dry-run", false, "check discovery/probe and exit without tunnel")
+	fs.StringVar(&opt.V2ClientConf, "gen-v2ray-client", "", "write v2ray client json")
+	fs.StringVar(&opt.V2ServerConf, "gen-v2ray-server", "", "write v2ray server json")
+	if err := fs.Parse(args); err != nil {
+		return options{}, err
+	}
 
 	if *vk == "" && *ya == "" {
-		log.Fatalf("need -vk-link or -yandex-link")
+		return options{}, errors.New("need -vk-link or -yandex-link")
 	}
-	if opt.Peer == "" {
-		log.Fatalf("need -peer")
+	if opt.Peer == "" && !opt.DryRun {
+		return options{}, errors.New("need -peer")
 	}
 	if *vk != "" {
 		opt.Link = *vk
@@ -159,7 +294,7 @@ func parseFlags() options {
 	if opt.V2ClientConf != "" || opt.V2ServerConf != "" {
 		generateV2(opt)
 	}
-	return opt
+	return opt, nil
 }
 
 func generateV2(opt options) {
@@ -184,23 +319,41 @@ func trap(cancel context.CancelFunc) {
 	}()
 }
 
-func connectionLoop(ctx context.Context, opt options, listenConn net.PacketConn, peer *net.UDPAddr, pool *turnPool, evader *dpi_evasion.Evasion) error {
+func connectionLoop(ctx context.Context, opt options, logger streamLogger, listenConn net.PacketConn, peer *net.UDPAddr, pool *turnPool, evader *dpi_evasion.Evasion, metrics *telemetry) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		default:
 		}
-		server := pool.pick()
-		if err := oneConnection(ctx, opt, listenConn, peer, server, evader); err != nil {
-			log.Printf("turn %s failed: %v", server.Host, err)
-			time.Sleep(300 * time.Millisecond)
+		node := pool.pick()
+		started := time.Now()
+		err := oneConnection(ctx, opt, logger, listenConn, peer, node.server, evader)
+		if err != nil {
+			metrics.failovers.Add(1)
+			fails := pool.report(node.server.Host, false)
+			backoff := backoffDuration(fails)
+			logger.log("failover", map[string]any{"turn_id": node.server.Host, "error": err.Error(), "backoff_ms": backoff.Milliseconds(), "health_score": fmt.Sprintf("%.2f", node.healthScore)})
+			time.Sleep(backoff)
 			continue
 		}
+		pool.report(node.server.Host, true)
+		metrics.reconnects.Add(1)
+		logger.log("reconnect", map[string]any{"turn_id": node.server.Host, "uptime_ms": time.Since(started).Milliseconds()})
 	}
 }
 
-func oneConnection(ctx context.Context, opt options, listenConn net.PacketConn, peer *net.UDPAddr, server turn_discovery.Server, evader *dpi_evasion.Evasion) error {
+func backoffDuration(fails int) time.Duration {
+	if fails < 1 {
+		fails = 1
+	}
+	if fails > 6 {
+		fails = 6
+	}
+	return time.Duration(150*(1<<(fails-1))) * time.Millisecond
+}
+
+func oneConnection(ctx context.Context, opt options, logger streamLogger, listenConn net.PacketConn, peer *net.UDPAddr, server turn_discovery.Server, evader *dpi_evasion.Evasion) error {
 	addr := net.JoinHostPort(server.Host, choosePort(server.Port, opt.Port))
 	conn, err := dialTURN(ctx, addr, server, opt.UDP, peer.IP.To4() != nil)
 	if err != nil {
@@ -227,6 +380,7 @@ func oneConnection(ctx context.Context, opt options, listenConn net.PacketConn, 
 	var packets uint64
 	started := time.Now()
 	buf := make([]byte, 1600)
+	logger.log("turn_connected", map[string]any{"turn_id": server.Host, "turn_addr": addr})
 	for {
 		if opt.RotateTurn && (packets > 10000 || time.Since(started) > 5*time.Minute) {
 			return fmt.Errorf("rotate-turn trigger")

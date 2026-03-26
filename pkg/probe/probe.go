@@ -14,12 +14,26 @@ type Result struct {
 	Reason   string
 }
 
+type Hook interface {
+	ObserveLatency(target string, latency time.Duration, err error)
+}
+
 func Run(ctx context.Context) Result {
+	return RunWithHook(ctx, nil)
+}
+
+func RunWithHook(ctx context.Context, hook Hook) Result {
 	blocked := "https://rutracker.org"
 	good := "https://www.google.com/generate_204"
 
 	goodLatency, gErr := probeHTTP(ctx, good)
+	if hook != nil {
+		hook.ObserveLatency(good, goodLatency, gErr)
+	}
 	blockedLatency, bErr := probeHTTP(ctx, blocked)
+	if hook != nil {
+		hook.ObserveLatency(blocked, blockedLatency, bErr)
+	}
 
 	if isRST(gErr) || isRST(bErr) {
 		return Result{Detected: true, Reason: "tcp reset"}
