@@ -1,0 +1,31 @@
+{
+  "inbounds": [
+    {
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 1080,
+      "settings": {
+        "udp": true
+      }
+    },
+    {
+      "protocol": "http",
+      "listen": "127.0.0.1",
+      "port": 8080
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "wireguard",
+      "settings": {
+        "domainStrategy": "ForceIPv4",
+        "mtu": 1280,
+        "peers": [
+          {
+            "endpoint": "127.0.0.1:9000"
+          }
+        ]
+      }
+    }
+  ]
+}

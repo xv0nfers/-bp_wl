@@ -1,0 +1,20 @@
+{
+  "inbounds": [
+    {
+      "protocol": "wireguard",
+      "listen": "0.0.0.0",
+      "port": 51820,
+      "settings": {
+        "mtu": 1280
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      }
+    }
+  ]
+}
